@@ -1,7 +1,7 @@
 %&preformat-disser
 \RequirePackage[l2tabu,orthodox]{nag} % Раскомментировав, можно в логе получать рекомендации относительно правильного использования пакетов и предупреждения об устаревших и нерекомендуемых пакетах
 % Формат А4, 14pt (ГОСТ Р 7.0.11-2011, 5.3.6)
-\documentclass[a4paper,14pt,oneside,openany]{memoir}
+\documentclass[a4paper,14pt,oneside,openany,oldfontcommands]{memoir}
 
 \input{common/setup}            % общие настройки шаблона
 \input{common/packages}         % Пакеты общие для диссертации и автореферата
@@ -49,28 +49,123 @@
 %
 % Если все команды закомментированы, то документ будет выведен в PDF файл полностью
 
-\begin{document}
+\usepackage{mdframed}
 
+\usepackage{minted}
+
+%\surroundwithmdframed{minted}
+
+%\RecustomVerbatimEnvironment{Verbatim}{BVerbatim}{}
+
+%\renewcommand{\figurename}{Listing}
+
+\newfontfamily\codeubuntu{Ubuntu Mono}[NFSSFamily=CodeUbuntu]
+
+\usemintedstyle{vs}
+\setminted[]{tabsize=2, fontfamily=CodeUbuntu, fontsize=\small, frame=lines, linenos, breaklines}
+%\setmintedinline[c++]{style=bw}
+\setmintedinline[]{fontsize=auto}
+
+\renewcommand{\textfraction}{0.05} 
+
+\usepackage{float}
+
+\makeatletter
+\renewcommand{\fps@figure}{H}
+\renewcommand{\fps@table}{H}
+\renewcommand{\fps@listing}{H}
+\makeatother
+
+
+\usepackage{xcolor}
+
+\usepackage{multicol}
+
+\usepackage{graphicx}
+
+\usepackage{changepage}
+
+\usepackage{caption}
+
+\lstset{
+	basicstyle=\fontsize{5}{5}\selectfont\ttfamily,
+	escapeinside={<@}{@>},
+	numbers=none,
+    frame=single,
+}
+
+\usepackage{fancyvrb}
+
+\makeatletter
+\newcommand{\iftoggleverb}[1]{%
+  \ifcsdef{etb@tgl@#1}
+    {\csname etb@tgl@#1\endcsname\iftrue\iffalse}
+    {\etb@noglobal\etb@err@notoggle{#1}\iffalse}%
+}
+\makeatother
+
+\newtoggle{pics}
+\toggletrue{pics}
+%\togglefalse{pics}
+
+\renewcommand\listingscaption{Листинг}
+
+\usepackage{graphbox}
+
+\hypersetup{breaklinks=true}
+
+\let\clsCenter\Center\let\clsendCenter\endCenter
+\let\Center\undefined\let\endCenter\undefined
+\usepackage{ragged2e}
+\let\Center\clsCenter
+\let\endCenter\clsendCenter
+
+\usepackage{numprint}
+\npthousandsep{\,}
+
+\newcommand{\CC}{C\nolinebreak\hspace{-.05em}\raisebox{.4ex}{\tiny\bf+}\nolinebreak\hspace{-.10em}\raisebox{.4ex}{\tiny\bf+}}
+
+\usepackage{makecell}
+
+\begin{document}
+	
 \input{common/renames}                 % Переопределение именований
 
 %%% Структура диссертации (ГОСТ Р 7.0.11-2011, 4)
-\include{Dissertation/title}           % Титульный лист
+%\include{Dissertation/title}           % Титульный лист
+
+
+\include{Dissertation/abstract}
+
+
 \include{Dissertation/contents}        % Оглавление
+
+
 \ifnumequal{\value{contnumfig}}{1}{}{\counterwithout{figure}{chapter}}
 \ifnumequal{\value{contnumtab}}{1}{}{\counterwithout{table}{chapter}}
-\include{Dissertation/introduction}    % Введение
-\ifnumequal{\value{contnumfig}}{1}{\counterwithout{figure}{chapter}
-}{\counterwithin{figure}{chapter}}
-\ifnumequal{\value{contnumtab}}{1}{\counterwithout{table}{chapter}
-}{\counterwithin{table}{chapter}}
-\include{Dissertation/part1}           % Глава 1
-\include{Dissertation/part2}           % Глава 2
-\include{Dissertation/part3}           % Глава 3
-\include{Dissertation/conclusion}      % Заключение
-\include{Dissertation/acronyms}        % Список сокращений и условных обозначений
-\include{Dissertation/dictionary}      % Словарь терминов
+
+
+\include{Dissertation/chapter1}
+\include{Dissertation/chapter2}
+\include{Dissertation/chapter3}
+\include{Dissertation/chapter4}
+\include{Dissertation/end}
+
+%\include{Dissertation/introduction}    % Введение
+%\ifnumequal{\value{contnumfig}}{1}{\counterwithout{figure}{chapter}
+%}{\counterwithin{figure}{chapter}}
+%\ifnumequal{\value{contnumtab}}{1}{\counterwithout{table}{chapter}
+%}{\counterwithin{table}{chapter}}
+%\include{Dissertation/part1}           % Глава 1
+%\include{Dissertation/part2}           % Глава 2
+%\include{Dissertation/part3}           % Глава 3
+%\include{Dissertation/conclusion}      % Заключение
+%\include{Dissertation/acronyms}        % Список сокращений и условных обозначений
+%\include{Dissertation/dictionary}      % Словарь терминов
+\Urlmuskip=0mu plus 1mu
+\raggedright
 \include{Dissertation/references}      % Список литературы
-\include{Dissertation/lists}           % Списки таблиц и изображений (иллюстративный материал)
+%\include{Dissertation/lists}           % Списки таблиц и изображений (иллюстративный материал)
 
 %%% Настройки для приложений
 \appendix

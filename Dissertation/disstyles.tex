@@ -17,9 +17,9 @@
 
 %%% Макет страницы %%%
 % Выставляем значения полей (ГОСТ 7.0.11-2011, 5.3.7)
-\geometry{a4paper, top=2cm, bottom=2cm, left=2.5cm, right=1cm, nofoot, nomarginpar} %, heightrounded, showframe
+\geometry{a4paper, top=2cm, bottom=2cm, left=3cm, right=1.5cm, nofoot, nomarginpar} %, heightrounded, showframe
 \setlength{\topskip}{0pt}   %размер дополнительного верхнего поля
-\setlength{\footskip}{12.3pt} % снимет warning, согласно https://tex.stackexchange.com/a/334346
+\setlength{\footskip}{35pt} % снимет warning, согласно https://tex.stackexchange.com/a/334346
 
 %%% Выравнивание и переносы %%%
 %% http://tex.stackexchange.com/questions/241343/what-is-the-meaning-of-fussy-sloppy-emergencystretch-tolerance-hbadness
@@ -76,10 +76,10 @@
 
 %%% Колонтитулы %%%
 % Порядковый номер страницы печатают на середине верхнего поля страницы (ГОСТ Р 7.0.11-2011, 5.3.8)
-\makeevenhead{plain}{}{\thepage}{}
-\makeoddhead{plain}{}{\thepage}{}
-\makeevenfoot{plain}{}{}{}
-\makeoddfoot{plain}{}{}{}
+\makeevenhead{plain}{}{}{}
+\makeoddhead{plain}{}{}{}
+\makeevenfoot{plain}{}{\thepage}{}
+\makeoddfoot{plain}{}{\thepage}{}
 \pagestyle{plain}
 
 %%% добавить Стр. над номерами страниц в оглавлении
@@ -214,3 +214,8 @@
     \regtotcounter{totalcount@table}       % Если иным способом поставить в преамбуле то ошибка в числе таблиц
     \regtotcounter{TotPages}               % Если иным способом поставить в преамбуле то ошибка в числе страниц
 }
+
+\setcounter{page}{2}
+
+\setlength{\parskip}{6pt}
+

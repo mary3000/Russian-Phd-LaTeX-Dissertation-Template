@@ -25,7 +25,7 @@
 \makeatletter
 \@ifundefined{c@usealtfont}{
   \newcounter{usealtfont}
-  \setcounter{usealtfont}{1}    % 0 --- шрифты на базе Computer Modern
+  \setcounter{usealtfont}{0}    % 0 --- шрифты на базе Computer Modern
                                 % 1 --- использовать пакет pscyr, при его
                                 %       наличии
                                 % 2 --- использовать пакет XCharter, при наличии
@@ -37,7 +37,7 @@
 \makeatletter
 \@ifundefined{c@fontfamily}{
   \newcounter{fontfamily}
-  \setcounter{fontfamily}{1}  % 0 --- CMU семейство. Используется как fallback;
+  \setcounter{fontfamily}{0}  % 0 --- CMU семейство. Используется как fallback;
                               % 1 --- Шрифты от MS (Times New Roman и компания)
                               % 2 --- Семейство Liberation
 }{}

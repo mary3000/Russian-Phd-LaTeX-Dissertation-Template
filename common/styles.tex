@@ -5,7 +5,7 @@
                                 % \DeclareRobustCommand protects \fixme
                                 % from expanding inside \MakeUppercase
 \AtBeginDocument{%
-    \setlength{\parindent}{2.5em}                   % Абзацный отступ. Должен быть одинаковым по всему тексту и равен пяти знакам (ГОСТ Р 7.0.11-2011, 5.3.7).
+    \setlength{\parindent}{1.25cm}                   % Абзацный отступ. Должен быть одинаковым по всему тексту и равен пяти знакам (ГОСТ Р 7.0.11-2011, 5.3.7).
 }
 
 %%% Таблицы %%%
@@ -70,11 +70,11 @@
 
 \hypersetup{
     linktocpage=true,           % ссылки с номера страницы в оглавлении, списке таблиц и списке рисунков
-%    linktoc=all,                % both the section and page part are links
+    linktoc=all,                % both the section and page part are links
 %    pdfpagelabels=false,        % set PDF page labels (true|false)
     plainpages=false,           % Forces page anchors to be named by the Arabic form  of the page number, rather than the formatted form
     colorlinks,                 % ссылки отображаются раскрашенным текстом, а не раскрашенным прямоугольником, вокруг текста
-    linkcolor={linkcolor},      % цвет ссылок типа ref, eqref и подобных
+    linkcolor={blue},      % цвет ссылок типа ref, eqref и подобных
     citecolor={citecolor},      % цвет ссылок-цитат
     urlcolor={urlcolor},        % цвет гиперссылок
 %    hidelinks,                  % Hide links (removing color and border)
@@ -92,9 +92,13 @@
     }
 }{}
 
+\let \olditemize=\itemize \let \endolditemize=\enditemize \renewenvironment{itemize}{\olditemize \itemsep0.5em}{\endolditemize}
+
+\let \oldenumerate=\enumerate \let \endoldenumerate=\endenumerate \renewenvironment{enumerate}{\oldenumerate \itemsep0.5em}{\endoldenumerate}
+
 %%% Списки %%%
 % Используем короткое тире (endash) для ненумерованных списков (ГОСТ 2.105-95, пункт 4.1.7, требует дефиса, но так лучше смотрится)
-\renewcommand{\labelitemi}{\normalfont\bfseries{--}}
+%\renewcommand{\labelitemi}{\normalfont\bfseries{--}}
 
 % Перечисление строчными буквами латинского алфавита (ГОСТ 2.105-95, 4.1.7)
 %\renewcommand{\theenumi}{\alph{enumi}}

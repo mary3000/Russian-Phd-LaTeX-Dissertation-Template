@@ -1,819 +1,4095 @@
-\chapter{Примеры вставки листингов программного кода}\label{app:A}
+\chapter{LFAlloc}\label{app:A}
 
-Для крупных листингов есть два способа. Первый красивый, но в нём могут быть
-проблемы с поддержкой кириллицы (у вас может встречаться в~комментариях
-и~печатаемых сообщениях), он представлен на листинге~\ref{lst:hwbeauty}.
-\begin{ListingEnv}[!h]% настройки floating аналогичны окружению figure
-    \captiondelim{ } % разделитель идентификатора с номером от наименования
-    \caption{Программа ,,Hello, world`` на \protect\cpp}\label{lst:hwbeauty}
-    % окружение учитывает пробелы и табуляции и применяет их в сответсвии с настройками
-    \begin{lstlisting}[language={[ISO]C++}]
-	#include <iostream>
-	using namespace std;
+\newenvironment{codebr}{\captionsetup{type=listing}}{}
 
-	int main() //кириллица в комментариях при xelatex и lualatex имеет проблемы с пробелами
-	{
-		cout << "Hello, world" << endl; //latin letters in commentaries
-		system("pause");
-		return 0;
-	}
-    \end{lstlisting}
-\end{ListingEnv}%
-Второй не~такой красивый, но без ограничений (см.~листинг~\ref{lst:hwplain}).
-\begin{ListingEnv}[!h]
-    \captiondelim{ } % разделитель идентификатора с номером от наименования
-    \caption{Программа ,,Hello, world`` без подсветки}\label{lst:hwplain}
-    \begin{Verb}
+\section{Код аллокатора}
 
-        #include <iostream>
-        using namespace std;
 
-        int main() //кириллица в комментариях
-        {
-            cout << "Привет, мир" << endl;
+\begin{codebr}
+	
+	\begin{minted}[linenos, frame=leftline, fontsize=\tiny]{c++}
+    
+class LockFreeStack {
+ public:
+  void Push(Node* node) {
+    Node* current_top = top_.load();
+    do {
+      node->next_.store(current_top);
+    } while (!top_.compare_exchange_weak(current_top, node));
+  }
+
+  void Append(Node* head) {
+    if (head == nullptr) {
+      return;
+    }
+
+    Node* tail = head;
+    Node* next = tail->next_.load();
+    while (next != nullptr) {
+      tail = next;
+      next = tail->next_.load();
+    }
+
+    Node* prev_top = top_.load();
+    do {
+      tail->next_ = prev_top;
+    } while (!top_.compare_exchange_weak(prev_top, head));
+  }
+
+  Node* Top() {
+    return top_.load();
+  }
+
+  Node* Pop() {
+    Node* curr_top = top_.load();
+    Node* next_top;
+    do {
+      if (curr_top == nullptr) {
+        break;
+      }
+      next_top = curr_top->next_.load();
+    } while (!top_.compare_exchange_weak(curr_top, next_top));
+    return curr_top;
+  }
+
+  bool TryClear(Node* expected) {
+    Node* desired = nullptr;
+    return top_.compare_exchange_strong(expected, desired);
+  }
+
+  StateDescription DescribeState(const std::string& name = "LFStack") {
+    StateDescription d{name};
+    auto head = top_.load();
+    std::stringstream chain;
+    while (head != nullptr) {
+      chain << "-> " << head->GetLabel();
+      head = head->next_;
+    }
+    d.Add("Blocks", chain.str());
+    return d;
+  }
+
+ private:
+  twist::stdlike::atomic<Node*> top_{nullptr};
+};
+
+//////////////////////////////////////////////////////////////////
+
+class LFAllocator {
+ public:
+  LFAllocator(MemoryPool& pool) {
+    twist::checker::ForkGuard guard;
+    for (auto& node : pool.GetNodes()) {
+      node.Acquire();
+      item_list_.Push(&node);
+    }
+  }
+
+  void Free(Node* node) {
+    if (allocation_count_.load() == 0) {
+      item_list_.Push(node);
+    } else {
+      pending_list_.Push(node);
+    }
+  }
+
+  bool Alloc() {
+    Node* pending_head = pending_list_.Top();
+
+    if (allocation_count_.fetch_add(1) == 0) {
+      if (pending_head != nullptr
+          && pending_list_.TryClear(pending_head)) {
+        auto head = pending_head;
+
+        pending_head = pending_head->next_.load();
+        head->Release();
+
+        item_list_.Append(pending_head);
+        allocation_count_.fetch_sub(1);
+
+        return true;
+      }
+    }
+
+    auto node = item_list_.Pop();
+    if (node != nullptr) {
+      node->Release();
+    }
+
+    allocation_count_.fetch_sub(1);
+
+    return node != nullptr;
+  }
+
+  Node* Top() {
+    return item_list_.Top();
+  }
+
+  Node* TopPending() {
+    return item_list_.Top();
+  }
+
+  StateDescription DescribeState() {
+    StateDescription d{"LFStack"};
+    d.Add(item_list_.DescribeState("Head"));
+    d.Add(pending_list_.DescribeState("Pending"));
+    d.Add("allocation_count_", allocation_count_.load());
+    return d;
+  }
+
+ private:
+  LockFreeStack item_list_;
+  LockFreeStack pending_list_;
+
+  twist::stdlike::atomic<int> allocation_count_{0};
+};
+
+\end{minted}
+%\caption{Код LFALLoc.}
+	
+\end{codebr}
+
+\section{Вспомогательный код (валидация памяти)}
+
+\begin{codebr}
+	
+\begin{minted}[linenos, frame=leftline, escapeinside=||, fontsize=\tiny]{c++}
+
+struct Node {
+  twist::stdlike::atomic<Node*> next_{nullptr};
+  bool free_{true};
+  std::string label_;
+
+  bool IsReleased() const {
+    return free_;
+  }
+
+  void Release() {
+    free_ = true;
+  }
+
+  void Acquire() {
+    free_ = false;
+  }
+
+  void SetLabel(const std::string& name) {
+    std::ostringstream os;
+    os << name << " (" << std::hex << this << std::dec << ") ";
+    label_ = os.str();
+  }
+
+  std::string GetLabel() const {
+    return label_;
+  }
+};
+
+class MemoryPool {
+ public:
+  MemoryPool(size_t count) {
+    nodes_ = std::vector<Node>{count};
+    char name = 'A';
+
+    for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
+      it->SetLabel(std::string(1, name++));
+    }
+  }
+
+  std::vector<Node>& GetNodes() {
+    return nodes_;
+  }
+
+  size_t ReleasedCount() const {
+    size_t cnt = 0;
+    for (auto& node : nodes_) {
+      if (node.IsReleased()) {
+        ++cnt;
+      }
+    }
+    return cnt;
+  }
+
+  Node* Get(size_t index) {
+    return &nodes_[index];
+  }
+
+  Node* Acquire(size_t index) {
+    for (auto& node : nodes_) {
+      if (node.IsReleased()) {
+        if (index == 0) {
+          node.Acquire();
+          return &node;
         }
-    \end{Verb}
-\end{ListingEnv}
-
-Можно использовать первый для вставки небольших фрагментов
-внутри текста, а второй для вставки полного
-кода в приложении, если таковое имеется.
-
-Если нужно вставить совсем короткий пример кода (одна или две строки),
-то~выделение  линейками и нумерация может смотреться чересчур громоздко.
-В таких случаях можно использовать окружения \texttt{lstlisting} или
-\texttt{Verb} без \texttt{ListingEnv}. Приведём такой пример
-с указанием языка программирования, отличного от~заданного по умолчанию:
-\begin{lstlisting}[language=Haskell]
-fibs = 0 : 1 : zipWith (+) fibs (tail fibs)
-\end{lstlisting}
-Такое решение~--- со вставкой нумерованных листингов покрупнее
-и вставок без выделения для маленьких фрагментов~--- выбрано,
-например, в книге Эндрю Таненбаума и Тодда Остина по архитектуре
-%компьютера~\autocite{TanAus2013} (см.~рис.~\ref{fig:tan-aus}).
-
-Наконец, для оформления идентификаторов внутри строк
-(функция \lstinline{main} и~тому подобное) используется
-\texttt{lstinline} или, самое простое, моноширинный текст
-(\texttt{\textbackslash texttt}).
-
-Пример~\ref{lst:internal3}, иллюстрирующий подключение переопределённого
-языка. Может быть полезным, если подсветка кода работает криво. Без
-дополнительного окружения, с подписью и ссылкой, реализованной встроенным
-средством.
-\begingroup
-\captiondelim{ } % разделитель идентификатора с номером от наименования
-\begin{lstlisting}[language={Renhanced},caption={Пример листинга c подписью собственными средствами},label={lst:internal3}]
-## Caching the Inverse of a Matrix
-
-## Matrix inversion is usually a costly computation and there may be some
-## benefit to caching the inverse of a matrix rather than compute it repeatedly
-## This is a pair of functions that cache the inverse of a matrix.
-
-## makeCacheMatrix creates a special "matrix" object that can cache its inverse
-
-makeCacheMatrix <- function(x = matrix()) {#кириллица в комментариях при xelatex и lualatex имеет проблемы с пробелами
-    i <- NULL
-    set <- function(y) {
-        x <<- y
-        i <<- NULL
+        |-{}-|index;
+      }
     }
-    get <- function() x
-    setSolved <- function(solve) i <<- solve
-    getSolved <- function() i
-    list(set = set, get = get,
-    setSolved = setSolved,
-    getSolved = getSolved)
+    TWIST_UNREACHABLE();
+  }
 
-}
-
-
-## cacheSolve computes the inverse of the special "matrix" returned by
-## makeCacheMatrix above. If the inverse has already been calculated (and the
-## matrix has not changed), then the cachesolve should retrieve the inverse from
-## the cache.
-
-cacheSolve <- function(x, ...) {
-    ## Return a matrix that is the inverse of 'x'
-    i <- x$getSolved()
-    if(!is.null(i)) {
-        message("getting cached data")
-        return(i)
+  StateDescription DescribeState(const std::string& name = "Memory") {
+    StateDescription description{name};
+    for (auto& node : nodes_) {
+      description.Add(node.GetLabel(), !node.free_);
     }
-    data <- x$get()
-    i <- solve(data, ...)
-    x$setSolved(i)
-    i
-}
-\end{lstlisting} %$ %Комментарий для корректной подсветки синтаксиса
-                 %вне листинга
-\endgroup
+    return description;
+  }
 
-Листинг~\ref{lst:external1} подгружается из внешнего файла. Приходится
-загружать без окружения дополнительного. Иначе по страницам не переносится.
-\begingroup
-\captiondelim{ } % разделитель идентификатора с номером от наименования
-    \lstinputlisting[lastline=78,language={R},caption={Листинг из внешнего файла},label={lst:external1}]{listings/run_analysis.R}
-\endgroup
+ private:
+  std::vector<Node> nodes_;
+};
 
-\chapter{Очень длинное название второго приложения, в~котором продемонстрирована работа с~длинными таблицами}\label{app:B}
+\end{minted}
+%\caption{Вспомогательный код.}
+	
+\end{codebr}
 
-\section{Подраздел приложения}\label{app:B1}
-Вот размещается длинная таблица:
-\fontsize{10pt}{10pt}\selectfont
-\begin{longtable*}[c]{|l|c|l|l|} %longtable* появляется из пакета ltcaption и даёт ненумерованную таблицу
-% \caption{Описание входных файлов модели}\label{Namelists}
-%\\
- \hline
- %\multicolumn{4}{|c|}{\textbf{Файл puma\_namelist}}        \\ \hline
- Параметр & Умолч. & Тип & Описание               \\ \hline
-                                              \endfirsthead   \hline
- \multicolumn{4}{|c|}{\small\slshape (продолжение)}        \\ \hline
- Параметр & Умолч. & Тип & Описание               \\ \hline
-                                              \endhead        \hline
-% \multicolumn{4}{|c|}{\small\slshape (окончание)}        \\ \hline
-% Параметр & Умолч. & Тип & Описание               \\ \hline
-%                                             \endlasthead        \hline
- \multicolumn{4}{|r|}{\small\slshape продолжение следует}  \\ \hline
-                                              \endfoot        \hline
-                                              \endlastfoot
- \multicolumn{4}{|l|}{\&INP}        \\ \hline
- kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
- kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
- \hline
-  %& & & \(\:\) \\
- \multicolumn{4}{|l|}{\&SURFPAR}        \\ \hline
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-      &   &     & 1: генерация белого шума                  \\
-      &   &     & 2: генерация белого шума симметрично относительно \\
-  & & & экватора    \\
- mars & 0 & int & 1: инициализация модели для планеты Марс     \\
- \hline
-\end{longtable*}
+\section{Код теста}\label{app:A3}
 
-\normalsize% возвращаем шрифт к нормальному
-\section{Ещё один подраздел приложения}\label{app:B2}
 
-Нужно больше подразделов приложения!
-Конвынёры витюпырата но нам, тебиквюэ мэнтётюм позтюлант ед про. Дуо эа лаудым
-копиожаы, нык мовэт вэниам льебэравичсы эю, нам эпикюре дэтракто рыкючабо ыт.
 
-Пример длинной таблицы с записью продолжения по ГОСТ 2.105:
 
-\begingroup
-    \centering
-    \small
-    \captionsetup[table]{skip=7pt} % смещение положения подписи
-    \begin{longtable}[c]{|l|c|l|l|}
-    \caption{Наименование таблицы средней длины}\label{tab:test5}% label всегда желательно идти после caption
-    \\[-0.45\onelineskip]
-    \hline
-    Параметр & Умолч. & Тип & Описание\\ \hline
-    \endfirsthead%
-    \caption*{Продолжение таблицы~\thetable}\\[-0.45\onelineskip]
-    \hline
-    Параметр & Умолч. & Тип & Описание\\ \hline
-    \endhead
-    \hline
-    \endfoot
-    \hline
-     \endlastfoot
-     \multicolumn{4}{|l|}{\&INP}        \\ \hline
-     kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-     kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-     \hline
-      %& & & $\:$ \\
-     \multicolumn{4}{|l|}{\&SURFPAR}        \\ \hline
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    kick & 1 & int & 0: инициализация без шума (\(p_s = const\)) \\
-          &   &     & 1: генерация белого шума                  \\
-          &   &     & 2: генерация белого шума симметрично относительно \\
-      & & & экватора    \\
-     mars & 0 & int & 1: инициализация модели для планеты Марс     \\
-    \end{longtable}
-\normalsize% возвращаем шрифт к нормальному
-\endgroup
-\section{Использование длинных таблиц с окружением \textit{longtabu}}\label{app:B2a}
+\begin{codebr}
+	
+	\begin{minted}[linenos, frame=leftline, fontsize=\tiny]{c++}
 
-В таблице~\ref{tab:test-functions} более книжный вариант
-длинной таблицы, используя окружение \verb!longtabu! и разнообразные
-\verb!toprule! \verb!midrule! \verb!bottomrule! из~пакета
-\verb!booktabs!. Чтобы визуально таблица смотрелась лучше, можно
-использовать следующие параметры: в самом начале задаётся расстояние
-между строчками с~помощью \verb!arraystretch!. Таблица задаётся на
-всю ширину, \verb!longtabu! позволяет делить ширину колонок
-пропорционально "--- тут три колонки в~пропорции 1.1:1:4 "--- для каждой
-колонки первый параметр в~описании \verb!X[]!. Кроме того, в~таблице
-убраны отступы слева и справа с~помощью \verb!@{}!
-в~преамбуле таблицы. К~первому и~второму столбцу применяется
-модификатор
+TEST_SUITE(AllocLockFreeStack) {
+  SIMPLE_CHECKER_TEST(Spec) {
+    MemoryPool pool{3};
+    LFAllocator stack{pool};
 
-\verb!>{\setlength{\baselineskip}{0.7\baselineskip}}!,
+    Trace("/tmp/alloc_lfstack/aba.log");
 
-\noindent который уменьшает межстрочный интервал в для текста таблиц (иначе
-заголовок второго столбца значительно шире, а двухстрочное имя
-сливается с~окружающими). Для первой и второй колонки текст в ячейках
-выравниваются по~центру как по~вертикали, так и по горизонтали "---
-задаётся буквами \verb!m!~и~\verb!c!~в~описании столбца \verb!X[]!.
+    PrintState([&stack, &pool]() {
+      StateDescription d{"LFAlloc"};
+      d.Add(stack.DescribeState());
+      d.Add(pool.DescribeState());
+      return d;
+    });
 
-Так как формулы большие "--- используется окружение \verb!alignedat!,
-чтобы отступ был одинаковый у всех формул "--- он сделан для всех, хотя
-для большей части можно было и не использовать.  Чтобы формулы
-занимали поменьше места в~каждом столбце формулы (где надо)
-используется \verb!\textstyle! "--- он~делает дроби меньше, у~знаков
-суммы и произведения "--- индексы сбоку. Иногда формула слишком большая,
-сливается со следующей, поэтому после неё ставится небольшой
-дополнительный отступ \verb!\vspace*{2ex}!. Для штрафных функций "---
-размер фигурных скобок задан вручную \verb!\Big\{!, т.\:к. не~умеет
-\verb!alignedat! работать с~\verb!\left! и~\verb!\right! через
-несколько строк/колонок.
+    AddInvariant([&stack]() -> std::pair<bool, std::string> {
+      ForkGuard guard;
 
-В примечании к таблице наоборот, окружение \verb!cases! даёт слишком
-большие промежутки между вариантами, чтобы их уменьшить, в конце
-каждой строчки окружения использовался отрицательный дополнительный
-отступ \verb!\\[-0.5em]!.
+      auto check_list = [](Node* node) {
+        while (node != nullptr) {
+          if (node->IsReleased()) {
+            return false;
+          }
+          node = node->next_.load();
+        }
+        return true;
+      };
 
-\begingroup % Ограничиваем область видимости arraystretch
-\renewcommand{\arraystretch}{1.6}%% Увеличение расстояния между рядами, для улучшения восприятия.
-\begin{longtabu} to \textwidth
-{%
-@{}>{\setlength{\baselineskip}{0.7\baselineskip}}X[1.1mc]%
->{\setlength{\baselineskip}{0.7\baselineskip}}X[1.1mc]%
-X[4]@{}%
-}
-    \caption{Тестовые функции для оптимизации, \(D\) "---
-      размерность. Для всех функций значение в точке глобального
-      минимума равно нулю.\label{tab:test-functions}}\\% label всегда желательно идти после caption
+      if (!check_list(stack.Top())) {
+        return {false, "ItemList: assertion failed"};
+      }
 
-    \toprule     %%% верхняя линейка
-    Имя           &Стартовый диапазон параметров &Функция  \\
-    \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
-    \endfirsthead
+      if (!check_list(stack.TopPending())) {
+        return {false, "PendingList: assertion failed"};
+      }
 
-    \multicolumn{3}{c}{\small\slshape (продолжение)}        \\
-    \toprule     %%% верхняя линейка
-    Имя           &Стартовый диапазон параметров &Функция  \\
-    \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
-    \endhead
+      return {true, ""};
+    }).ExpectFail();
 
-    \multicolumn{3}{c}{\small\slshape (окончание)}        \\
-    \toprule     %%% верхняя линейка
-    Имя           &Стартовый диапазон параметров &Функция  \\
-    \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
-    \endlasthead
+    auto worker = [&stack, &pool]() {
+      while (true) {
+        size_t available = pool.ReleasedCount();
+        int node_index = Random(available + 1);
+        if (node_index == 0) {
+          SHOW_NOTE("Alloc(): before");
+          stack.Alloc();
+          SHOW_NOTE("Alloc(): after");
+        } else {
+          SHOW_NOTE("Free(): before");
+          Node* to_free = pool.Acquire(node_index - 1);
+          stack.Free(to_free);
+          SHOW_NOTE("Free(): after");
+        }
+      }
+    };
 
-    \bottomrule %%% нижняя линейка
-    \multicolumn{3}{r}{\small\slshape продолжение следует}  \\
-    \endfoot
-    \endlastfoot
+    std::vector<twist::stdlike::thread> threads;
+    for (size_t i = 0; i < 3; ++i) {
+      threads.emplace_back(worker);
+    }
 
-    сфера         &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_1(x)=\sum_{i=1}^Dx_i^2
-        \end{aligned}\) \\
-    Schwefel 2.22 &\(\left[-10,\,10\right]^D\)     &
-        \(\begin{aligned}
-            \textstyle f_2(x)=\sum_{i=1}^D|x_i|+\prod_{i=1}^D|x_i|
-        \end{aligned}\) \\
-    Schwefel 1.2  &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_3(x)=\sum_{i=1}^D\left(\sum_{j=1}^ix_j\right)^2
-        \end{aligned}\) \\
-    Schwefel 2.21 &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_4(x)=\max_i\!\left\{\left|x_i\right|\right\}
-        \end{aligned}\) \\
-    Rosenbrock    &\(\left[-30,\,30\right]^D\)     &
-        \(\begin{aligned}
-            \textstyle f_5(x)=
-            \sum_{i=1}^{D-1}
-            \left[100\!\left(x_{i+1}-x_i^2\right)^2+(x_i-1)^2\right]
-        \end{aligned}\) \\
-    ступенчатая   &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_6(x)=\sum_{i=1}^D\big\lfloor x_i+0.5\big\rfloor^2
-        \end{aligned}\) \\
-    зашумлённая квартическая &\(\left[-1.28,\,1.28\right]^D\) &
-        \(\begin{aligned}
-            \textstyle f_7(x)=\sum_{i=1}^Dix_i^4+rand[0,1)
-        \end{aligned}\)\vspace*{2ex}\\
-    Schwefel 2.26 &\(\left[-500,\,500\right]^D\)   &
-        \(\begin{aligned}
-        f_8(x)= &\textstyle\sum_{i=1}^D-x_i\,\sin\sqrt{|x_i|}\,+ \\
-                &\vphantom{\sum}+ D\cdot
-                418.98288727243369
-        \end{aligned}\)\\
-    Rastrigin     &\(\left[-5.12,\,5.12\right]^D\) &
-    \(\begin{aligned}
-        \textstyle f_9(x)=\sum_{i=1}^D\left[x_i^2-10\,\cos(2\pi x_i)+10\right]
-    \end{aligned}\)\vspace*{2ex}\\
-    Ackley        &\(\left[-32,\,32\right]^D\)     &
-        \(\begin{aligned}
-            f_{10}(x)= &\textstyle -20\, \exp\!\left(
-                            -0.2\sqrt{\frac{1}{D}\sum_{i=1}^Dx_i^2} \right)-\\
-                       &\textstyle - \exp\left(
-                            \frac{1}{D}\sum_{i=1}^D\cos(2\pi x_i)  \right)
-                       + 20 + e
-        \end{aligned}\) \\
-    Griewank      &\(\left[-600,\,600\right]^D\) &
-        \(\begin{aligned}
-            f_{11}(x)= &\textstyle \frac{1}{4000}\sum_{i=1}^{D}x_i^2 -
-                \prod_{i=1}^D\cos\left(x_i/\sqrt{i}\right) +1
-        \end{aligned}\) \vspace*{3ex} \\
-    штрафная 1    &\(\left[-50,\,50\right]^D\)     &
-        \(\begin{aligned}
-            f_{12}(x)= &\textstyle \frac{\pi}{D}\Big\{ 10\,\sin^2(\pi y_1) +\\
-            &+\textstyle \sum_{i=1}^{D-1}(y_i-1)^2
-                \left[1+10\,\sin^2(\pi y_{i+1})\right] +\\
-            &+(y_D-1)^2 \Big\} +\textstyle\sum_{i=1}^D u(x_i,\,10,\,100,\,4)
-        \end{aligned}\) \vspace*{2ex} \\
-    штрафная 2    &\(\left[-50,\,50\right]^D\)     &
-        \(\begin{aligned}
-            f_{13}(x)= &\textstyle 0.1 \Big\{\sin^2(3\pi x_1) +\\
-            &+\textstyle \sum_{i=1}^{D-1}(x_i-1)^2
-                \left[1+\sin^2(3 \pi x_{i+1})\right] + \\
-            &+(x_D-1)^2\left[1+\sin^2(2\pi x_D)\right] \Big\} +\\
-            &+\textstyle\sum_{i=1}^D u(x_i,\,5,\,100,\,4)
-        \end{aligned}\)\\
-    сфера         &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_1(x)=\sum_{i=1}^Dx_i^2
-        \end{aligned}\) \\
-    Schwefel 2.22 &\(\left[-10,\,10\right]^D\)     &
-        \(\begin{aligned}
-            \textstyle f_2(x)=\sum_{i=1}^D|x_i|+\prod_{i=1}^D|x_i|
-        \end{aligned}\) \\
-    Schwefel 1.2  &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_3(x)=\sum_{i=1}^D\left(\sum_{j=1}^ix_j\right)^2
-        \end{aligned}\) \\
-    Schwefel 2.21 &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_4(x)=\max_i\!\left\{\left|x_i\right|\right\}
-        \end{aligned}\) \\
-    Rosenbrock    &\(\left[-30,\,30\right]^D\)     &
-        \(\begin{aligned}
-            \textstyle f_5(x)=
-            \sum_{i=1}^{D-1}
-            \left[100\!\left(x_{i+1}-x_i^2\right)^2+(x_i-1)^2\right]
-        \end{aligned}\) \\
-    ступенчатая   &\(\left[-100,\,100\right]^D\)   &
-        \(\begin{aligned}
-            \textstyle f_6(x)=\sum_{i=1}^D\big\lfloor x_i+0.5\big\rfloor^2
-        \end{aligned}\) \\
-    зашумлённая квартическая &\(\left[-1.28,\,1.28\right]^D\) &
-        \(\begin{aligned}
-            \textstyle f_7(x)=\sum_{i=1}^Dix_i^4+rand[0,1)
-        \end{aligned}\)\vspace*{2ex}\\
-    Schwefel 2.26 &\(\left[-500,\,500\right]^D\)   &
-        \(\begin{aligned}
-        f_8(x)= &\textstyle\sum_{i=1}^D-x_i\,\sin\sqrt{|x_i|}\,+ \\
-                &\vphantom{\sum}+ D\cdot
-                418.98288727243369
-        \end{aligned}\)\\
-    Rastrigin     &\(\left[-5.12,\,5.12\right]^D\) &
-    \(\begin{aligned}
-        \textstyle f_9(x)=\sum_{i=1}^D\left[x_i^2-10\,\cos(2\pi x_i)+10\right]
-    \end{aligned}\)\vspace*{2ex}\\
-    Ackley        &\(\left[-32,\,32\right]^D\)     &
-        \(\begin{aligned}
-            f_{10}(x)= &\textstyle -20\, \exp\!\left(
-                            -0.2\sqrt{\frac{1}{D}\sum_{i=1}^Dx_i^2} \right)-\\
-                       &\textstyle - \exp\left(
-                            \frac{1}{D}\sum_{i=1}^D\cos(2\pi x_i)  \right)
-                       + 20 + e
-        \end{aligned}\) \\
-    Griewank      &\(\left[-600,\,600\right]^D\) &
-        \(\begin{aligned}
-            f_{11}(x)= &\textstyle \frac{1}{4000}\sum_{i=1}^{D}x_i^2 -
-                \prod_{i=1}^D\cos\left(x_i/\sqrt{i}\right) +1
-        \end{aligned}\) \vspace*{3ex} \\
-    штрафная 1    &\(\left[-50,\,50\right]^D\)     &
-        \(\begin{aligned}
-            f_{12}(x)= &\textstyle \frac{\pi}{D}\Big\{ 10\,\sin^2(\pi y_1) +\\
-            &+\textstyle \sum_{i=1}^{D-1}(y_i-1)^2
-                \left[1+10\,\sin^2(\pi y_{i+1})\right] +\\
-            &+(y_D-1)^2 \Big\} +\textstyle\sum_{i=1}^D u(x_i,\,10,\,100,\,4)
-        \end{aligned}\) \vspace*{2ex} \\
-    штрафная 2    &\(\left[-50,\,50\right]^D\)     &
-        \(\begin{aligned}
-            f_{13}(x)= &\textstyle 0.1 \Big\{\sin^2(3\pi x_1) +\\
-            &+\textstyle \sum_{i=1}^{D-1}(x_i-1)^2
-                \left[1+\sin^2(3 \pi x_{i+1})\right] + \\
-            &+(x_D-1)^2\left[1+\sin^2(2\pi x_D)\right] \Big\} +\\
-            &+\textstyle\sum_{i=1}^D u(x_i,\,5,\,100,\,4)
-        \end{aligned}\)\\
-    \midrule%%% тонкий разделитель
-    \multicolumn{3}{@{}p{\textwidth}}{%
-        \vspace*{-3.5ex}% этим подтягиваем повыше
-        \hspace*{2.5em}% абзацный отступ - требование ГОСТ 2.105
-        Примечание "---  Для функций \(f_{12}\) и \(f_{13}\)
-        используется \(y_i = 1 + \frac{1}{4}(x_i+1)\)
-        и~$u(x_i,\,a,\,k,\,m)=
-            \begin{cases*}
-                k(x_i-a)^m,& \( x_i >a \)\\[-0.5em]
-                0,& \( -a\leq x_i \leq a \)\\[-0.5em]
-                k(-x_i-a)^m,& \( x_i <-a \)
-            \end{cases*}
-        $
-}\\
-\bottomrule %%% нижняя линейка
-\end{longtabu}
-\endgroup
-
-\section{Форматирование внутри таблиц}\label{app:B3}
-
-В таблице~\ref{tab:other-row} пример с чересстрочным
-форматированием. В~файле \verb+userstyles.tex+  задаётся счётчик
-\verb+\newcounter{rowcnt}+ который увеличивается на~1 после каждой
-строчки (как указано в преамбуле таблицы). Кроме того, задаётся
-условный макрос \verb+\altshape+ который выдаёт одно
-из~двух типов форматирования в~зависимости от чётности счётчика.
-
-В таблице~\ref{tab:other-row} каждая чётная строчка "--- синяя,
-нечётная "--- с наклоном и~слегка поднята вверх. Визуально это приводит
-к тому, что среднее значение и~среднеквадратичное изменение
-группируются и хорошо выделяются взглядом в~таблице. Сохраняется
-возможность отдельные значения в таблице выделить цветом или
-шрифтом. К первому и второму столбцу форматирование не применяется
-по~сути таблицы, к шестому общее форматирование не~применяется для
-наглядности.
-
-Так как заголовок таблицы тоже считается за строчку, то перед ним (для
-первого, промежуточного и финального варианта) счётчик обнуляется,
-а~в~\verb+\altshape+ для нулевого значения счётчика форматирования
-не~применяется.
-
-\begingroup % Ограничиваем область видимости arraystretch
-\renewcommand\altshape{
-  \ifnumequal{\value{rowcnt}}{0}{
-    % Стиль для заголовка таблицы
-  }{
-    \ifnumodd{\value{rowcnt}}
-    {
-      \color{blue} % Cтиль для нечётных строк
-    }{
-      \vspace*{-0.7ex}\itshape} % Стиль для чётных строк
+    for (auto& th : threads) {
+      th.join();
+    }
   }
 }
-\newcolumntype{A}{>{\centering\begingroup\altshape}X[1mc]<{\endgroup}}
-\needspace{2\baselineskip}
-\renewcommand{\arraystretch}{0.9}%% Уменьшаем  расстояние между
-                                %% рядами, чтобы таблица не так много
-                                %% места занимала в дисере.
-\begin{longtabu} to \textwidth {@{}X[0.27ml]@{}X[0.7mc]@{}A@{}A@{}A@{}X[0.98mc]@{}>{\setlength{\baselineskip}{0.7\baselineskip}}A@{}A<{\stepcounter{rowcnt}}@{}}
-% \begin{longtabu} to \textwidth {@{}X[0.2ml]X[1mc]X[1mc]X[1mc]X[1mc]X[1mc]>{\setlength{\baselineskip}{0.7\baselineskip}}X[1mc]X[1mc]@{}}
-  \caption{Длинная таблица с примером чересстрочного форматирования\label{tab:other-row}}\vspace*{1ex}\\% label всегда желательно идти после caption
-  % \vspace*{1ex}     \\
 
-  \toprule %%% верхняя линейка
-\setcounter{rowcnt}{0} &Итера\-ции & JADE\texttt{++} & JADE & jDE & SaDE
-& DE/rand /1/bin & PSO \\
- \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
- \endfirsthead
+	\end{minted}
+	%\caption{Тест LFALLoc.}
+	
+\end{codebr}
 
- \multicolumn{8}{c}{\small\slshape (продолжение)} \\
- \toprule %%% верхняя линейка
-\setcounter{rowcnt}{0} &Итера\-ции & JADE\texttt{++} & JADE & jDE & SaDE
-& DE/rand /1/bin & PSO \\
- \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
- \endhead
+\pagebreak
 
- \multicolumn{8}{c}{\small\slshape (окончание)} \\
- \toprule %%% верхняя линейка
-\setcounter{rowcnt}{0} &Итера\-ции & JADE\texttt{++} & JADE & jDE & SaDE
-& DE/rand /1/bin & PSO \\
- \midrule %%% тонкий разделитель. Отделяет названия столбцов. Обязателен по ГОСТ 2.105 пункт 4.4.5
- \endlasthead
+\section{Траектория}\label{app:trace}
 
- \bottomrule %%% нижняя линейка
- \multicolumn{8}{r}{\small\slshape продолжение следует}     \\
- \endfoot
- \endlastfoot
+\begin{adjustwidth}{-3.3cm}{-1cm}
 
-f1  & 1500 & \textbf{1.8E-60}   & 1.3E-54   & 2.5E-28   & 4.5E-20   & 9.8E-14   & 9.6E-42   \\\nopagebreak
-    &      & (8.4E-60) & (9.2E-54) & {\color{red}(3.5E-28)} & (6.9E-20) & (8.4E-14) & (2.7E-41) \\
-f2  & 2000 & 1.8E-25   & 3.9E-22   & 1.5E-23   & 1.9E-14   & 1.6E-09   & 9.3E-21   \\\nopagebreak
-    &      & (8.8E-25) & (2.7E-21) & (1.0E-23) & (1.1E-14) & (1.1E-09) & (6.3E-20) \\
-f3  & 5000 & 5.7E-61   & 6.0E-87   & 5.2E-14   & {\color{green}9.0E-37}   & 6.6E-11   & 2.5E-19   \\\nopagebreak
-    &      & (2.7E-60) & (1.9E-86) & (1.1E-13) & (5.4E-36) & (8.8E-11) & (3.9E-19) \\
-f4  & 5000 & 8.2E-24   & 4.3E-66   & 1.4E-15   & 7.4E-11   & 4.2E-01   & 4.4E-14   \\\nopagebreak
-    &      & (4.0E-23) & (1.2E-65) & (1.0E-15) & (1.8E-10) & (1.1E+00) & (9.3E-14) \\
-f5  & 3000 & 8.0E-02   & 3.2E-01   & 1.3E+01   & 2.1E+01   & 2.1E+00   & 2.5E+01   \\\nopagebreak
-    &      & (5.6E-01) & (1.1E+00) & (1.4E+01) & (7.8E+00) & (1.5E+00) & (3.2E+01) \\
-f6  & 100  & 2.9E+00   & 5.6E+00   & 1.0E+03   & 9.3E+02   & 4.7E+03   & 4.5E+01   \\\nopagebreak
-    &      & (1.2E+00) & (1.6E+00) & (2.2E+02) & (1.8E+02) & (1.1E+03) & (2.4E+01) \\
-f7  & 3000 & 6.4E-04   & 6.8E-04   & 3.3E-03   & 4.8E-03   & 4.7E-03   & 2.5E-03   \\\nopagebreak
-    &      & (2.5E-04) & (2.5E-04) & (8.5E-04) & (1.2E-03) & (1.2E-03) & (1.4E-03) \\
-f8  & 1000 & 3.3E-05   & 7.1E+00   & 7.9E-11   & 4.7E+00   & 5.9E+03   & 2.4E+03   \\\nopagebreak
-    &      & (2.3E-05) & (2.8E+01) & (1.3E-10) & (3.3E+01) & (1.1E+03) & (6.7E+02) \\
-f9  & 1000 & 1.0E-04   & 1.4E-04   & 1.5E-04   & 1.2E-03   & 1.8E+02   & 5.2E+01   \\\nopagebreak
-    &      & (6.0E-05) & (6.5E-05) & (2.0E-04) & (6.5E-04) & (1.3E+01) & (1.6E+01) \\
-f10 & 500  & 8.2E-10   & 3.0E-09   & 3.5E-04   & 2.7E-03   & 1.1E-01   & 4.6E-01   \\\nopagebreak
-    &      & (6.9E-10) & (2.2E-09) & (1.0E-04) & (5.1E-04) & (3.9E-02) & (6.6E-01) \\
-f11 & 500  & 9.9E-08   & 2.0E-04   & 1.9E-05   & 7.8E-04  & 2.0E-01   & 1.3E-02   \\\nopagebreak
-    &      & (6.0E-07) & (1.4E-03) & (5.8E-05) & (1.2E-03)  & (1.1E-01) & (1.7E-02) \\
-f12 & 500  & 4.6E-17   & 3.8E-16   & 1.6E-07   & 1.9E-05   & 1.2E-02   & 1.9E-01   \\\nopagebreak
-    &      & (1.9E-16) & (8.3E-16) & (1.5E-07) & (9.2E-06) & (1.0E-02) & (3.9E-01) \\
-f13 & 500  & 2.0E-16   & 1.2E-15   & 1.5E-06   & 6.1E-05   & 7.5E-02   & 2.9E-03   \\\nopagebreak
-    &      & (6.5E-16) & (2.8E-15) & (9.8E-07) & (2.0E-05) & (3.8E-02) & (4.8E-03) \\
-f1  & 1500 & \textbf{1.8E-60}   & 1.3E-54   & 2.5E-28   & 4.5E-20   & 9.8E-14   & 9.6E-42   \\\nopagebreak
-    &      & (8.4E-60) & (9.2E-54) & {\color{red}(3.5E-28)} & (6.9E-20) & (8.4E-14) & (2.7E-41) \\
-f2  & 2000 & 1.8E-25   & 3.9E-22   & 1.5E-23   & 1.9E-14   & 1.6E-09   & 9.3E-21   \\\nopagebreak
-    &      & (8.8E-25) & (2.7E-21) & (1.0E-23) & (1.1E-14) & (1.1E-09) & (6.3E-20) \\
-f3  & 5000 & 5.7E-61   & 6.0E-87   & 5.2E-14   & 9.0E-37   & 6.6E-11   & 2.5E-19   \\\nopagebreak
-    &      & (2.7E-60) & (1.9E-86) & (1.1E-13) & (5.4E-36) & (8.8E-11) & (3.9E-19) \\
-f4  & 5000 & 8.2E-24   & 4.3E-66   & 1.4E-15   & 7.4E-11   & 4.2E-01   & 4.4E-14   \\\nopagebreak
-    &      & (4.0E-23) & (1.2E-65) & (1.0E-15) & (1.8E-10) & (1.1E+00) & (9.3E-14) \\
-f5  & 3000 & 8.0E-02   & 3.2E-01   & 1.3E+01   & 2.1E+01   & 2.1E+00   & 2.5E+01   \\\nopagebreak
-    &      & (5.6E-01) & (1.1E+00) & (1.4E+01) & (7.8E+00) & (1.5E+00) & (3.2E+01) \\
-f6  & 100  & 2.9E+00   & 5.6E+00   & 1.0E+03   & 9.3E+02   & 4.7E+03   & 4.5E+01   \\\nopagebreak
-    &      & (1.2E+00) & (1.6E+00) & (2.2E+02) & (1.8E+02) & (1.1E+03) & (2.4E+01) \\
-f7  & 3000 & 6.4E-04   & 6.8E-04   & 3.3E-03   & 4.8E-03   & 4.7E-03   & 2.5E-03   \\\nopagebreak
-    &      & (2.5E-04) & (2.5E-04) & (8.5E-04) & (1.2E-03) & (1.2E-03) & (1.4E-03) \\
-f8  & 1000 & 3.3E-05   & 7.1E+00   & 7.9E-11   & 4.7E+00   & 5.9E+03   & 2.4E+03   \\\nopagebreak
-    &      & (2.3E-05) & (2.8E+01) & (1.3E-10) & (3.3E+01) & (1.1E+03) & (6.7E+02) \\
-f9  & 1000 & 1.0E-04   & 1.4E-04   & 1.5E-04   & 1.2E-03   & 1.8E+02   & 5.2E+01   \\\nopagebreak
-    &      & (6.0E-05) & (6.5E-05) & (2.0E-04) & (6.5E-04) & (1.3E+01) & (1.6E+01) \\
-f10 & 500  & 8.2E-10   & 3.0E-09   & 3.5E-04   & 2.7E-03   & 1.1E-01   & 4.6E-01   \\\nopagebreak
-    &      & (6.9E-10) & (2.2E-09) & (1.0E-04) & (5.1E-04) & (3.9E-02) & (6.6E-01) \\
-f11 & 500  & 9.9E-08   & 2.0E-04   & 1.9E-05   & 7.8E-04  & 2.0E-01   & 1.3E-02   \\\nopagebreak
-    &      & (6.0E-07) & (1.4E-03) & (5.8E-05) & (1.2E-03)  & (1.1E-01) & (1.7E-02) \\
-f12 & 500  & 4.6E-17   & 3.8E-16   & 1.6E-07   & 1.9E-05   & 1.2E-02   & 1.9E-01   \\\nopagebreak
-    &      & (1.9E-16) & (8.3E-16) & (1.5E-07) & (9.2E-06) & (1.0E-02) & (3.9E-01) \\
-f13 & 500  & 2.0E-16   & 1.2E-15   & 1.5E-06   & 6.1E-05   & 7.5E-02   & 2.9E-03   \\\nopagebreak
-    &      & (6.5E-16) & (2.8E-15) & (9.8E-07) & (2.0E-05) & (3.8E-02) & (4.8E-03) \\
-\bottomrule %%% нижняя линейка
-\end{longtabu} \endgroup
+\definecolor{yellow}{rgb}{1.0, 0.75, 0.0}
 
-\section{Стандартные префиксы ссылок}\label{app:B4}
+%\newfontfamily\myfont[<font features>]{<name of font>}
 
-Общепринятым является следующий формат ссылок: \texttt{<prefix>:<label>}.
-Например, \verb+\label{fig:knuth}+; \verb+\ref{tab:test1}+; \verb+label={lst:external1}+.
-В~таблице~\ref{tab:tab_pref} приведены стандартные префиксы для различных типов ссылок.
+\newenvironment{allintypewriter}{\ttfamily}{\par}
 
-\begin{table}[htbp]
-        \captionsetup{justification=centering}
-        \centering{
-                \caption{\label{tab:tab_pref}Стандартные префиксы ссылок}
-                \begin{tabular}{ll}
-                        \toprule
-                        \textbf{Префикс} & \textbf{Описание} \\
-                        \midrule
-                        ch:     & Глава             \\
-                        sec:    & Секция            \\
-                        subsec: & Подсекция         \\
-                        fig:    & Рисунок           \\
-                        tab:    & Таблица           \\
-                        eq:     & Уравнение         \\
-                        lst:    & Листинг программы \\
-                        itm:    & Элемент списка    \\
-                        alg:    & Алгоритм          \\
-                        app:    & Секция приложения \\
-                        \bottomrule
-                \end{tabular}
-        }
-\end{table}
+%\setlength{\columnseprule}{0.5pt}
+\def\columnseprulecolor{\color{gray}}
+\setlength\columnsep{0pt}
+
+\begin{allintypewriter}
+%\fontfamily{ptm}\selectfont 
+
+\noindent
+\obeyspaces
+\begin{multicols*}{2}
+\noindent	
+\obeyspaces
+\begin{lstlisting}[numbers=none]
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                 <@\textcolor{yellow}{THREAD SWITCHING HISTORY}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+0 1 1 1 1 1 1 21 2 1 1 2 2 2 2 2 3 3 2 2 20 2 3 1 1 1 2 2 1 11 1 1 2 1 11 1 1 1 1 1 1 1 1 
+1 3 3 3 3 3 3 2 
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 1 (THREAD 0)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+STATE: STARTING
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+Joining thread 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+STATE: RUNNING -> SUSPENDED
+
+Blocked by event awaiting (wait queue: 0)
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 2 (THREAD 1)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+STATE: STARTING
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fc21bc8cea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 1}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  42:   Node* Pop() {
+> <@\textcolor{magenta}{43:     Node* curr\_top = top\_.load();}@>
+  44:     Node* next_top;
+
+Local variables: 
+curr_top = 0x100000005
+next_top = 0x100000000
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96070
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 4}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  48:       }
+> <@\textcolor{magenta}{49:       next\_top = curr\_top->next\_.load();}@>
+  50:     } while (!top_.compare_exchange_weak(curr_top, next_top));
+
+Local variables: 
+curr_top = 0x7fc21bc96070
+next_top = 0x100000000
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96040
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 5}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96070
+next_top = 0x7fc21bc96040
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			<@\textcolor{red}{[*] Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) }@>
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		<@\textcolor{red}{[*] A (0x7fc21bc96070) : 0}@>
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{120:     allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+pending_head = 0x0
+node = 0x7fc21bc96070
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 3 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+STATE: STARTING
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+Free(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		<@\textcolor{red}{[*] A (0x7fc21bc96070) : 1}@>
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  87:   void Free(Node* node) /*__attribute__((noinline))*/ {
+> <@\textcolor{magenta}{88:     if (allocation\_count\_.load() == 0) \{}@>
+  89:       item_list_.Push(node);
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  13:   void Push(Node* node) {
+> <@\textcolor{magenta}{14:     Node* current\_top = top\_.load();}@>
+  15:     do {
+
+Local variables: 
+current_top = 0x100413133
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 4 (THREAD 1)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{120:     allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+pending_head = 0x0
+node = 0x7fc21bc96070
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_sub(): prev = 1
+
+Alloc(): after
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 0}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fc21bc8cea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 5 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  13:   void Push(Node* node) {
+> <@\textcolor{magenta}{14:     Node* current\_top = top\_.load();}@>
+  15:     do {
+
+Local variables: 
+current_top = 0x100413133
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  15:     do {
+> <@\textcolor{magenta}{16:       node->next\_.store(current\_top);}@>
+  17:     } while (!top_.compare_exchange_weak(current_top, node));
+
+Local variables: 
+current_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  16:       node->next_.store(current_top);
+> <@\textcolor{magenta}{17:     \} while (!top\_.compare\_exchange\_weak(current\_top, node));}@>
+  18:   }
+
+Local variables: 
+current_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+Free(): after
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			<@\textcolor{red}{[*] Blocks: -> A (0x7fc21bc96070) }@>
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fb80b3baea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96070
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 4}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 1}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::TryClear(Node*)
+  55:     Node* desired = nullptr;
+> <@\textcolor{magenta}{56:     return top\_.compare\_exchange\_strong(expected, desired);}@>
+  57:   }
+
+Local variables: 
+desired = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+> <@\textcolor{magenta}{101:           \&\& pending\_list\_.TryClear(pending\_head)) \{}@>
+  102:         auto head = pending_head;
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 6 (THREAD 3)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+STATE: STARTING
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fb80b3b1ea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96070
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 7 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::TryClear(Node*)
+  55:     Node* desired = nullptr;
+> <@\textcolor{magenta}{56:     return top\_.compare\_exchange\_strong(expected, desired);}@>
+  57:   }
+
+Local variables: 
+desired = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+> <@\textcolor{magenta}{101:           \&\& pending\_list\_.TryClear(pending\_head)) \{}@>
+  102:         auto head = pending_head;
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_strong(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			<@\textcolor{red}{[*] Blocks: }@>
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{104:         pending\_head = pending\_head->next\_.load();}@>
+  105:         head->Release();
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 1
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		<@\textcolor{red}{[*] A (0x7fc21bc96070) : 0}@>
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  108:         // pending_count_.fetch_add(1);
+> <@\textcolor{magenta}{109:         allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_sub(): prev = 1
+
+Alloc(): after
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 0}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fb80b3baea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 0
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 8 (THREAD 3)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 1}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::TryClear(Node*)
+  55:     Node* desired = nullptr;
+> <@\textcolor{magenta}{56:     return top\_.compare\_exchange\_strong(expected, desired);}@>
+  57:   }
+
+Local variables: 
+desired = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+> <@\textcolor{magenta}{101:           \&\& pending\_list\_.TryClear(pending\_head)) \{}@>
+  102:         auto head = pending_head;
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                     <@\textcolor{yellow}{RUN 9 (THREAD 1)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 2}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  42:   Node* Pop() {
+> <@\textcolor{magenta}{43:     Node* curr\_top = top\_.load();}@>
+  44:     Node* next_top;
+
+Local variables: 
+curr_top = 0x100000005
+next_top = 0x100000001
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96040
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  48:       }
+> <@\textcolor{magenta}{49:       next\_top = curr\_top->next\_.load();}@>
+  50:     } while (!top_.compare_exchange_weak(curr_top, next_top));
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x100000001
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96010
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x7fc21bc96010
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 10 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 2
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 3}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  42:   Node* Pop() {
+> <@\textcolor{magenta}{43:     Node* curr\_top = top\_.load();}@>
+  44:     Node* next_top;
+
+Local variables: 
+curr_top = 0x100000005
+next_top = 0x100000002
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96040
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> B (0x7fc21bc96040) -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  48:       }
+> <@\textcolor{magenta}{49:       next\_top = curr\_top->next\_.load();}@>
+  50:     } while (!top_.compare_exchange_weak(curr_top, next_top));
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x100000002
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 11 (THREAD 1)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x7fc21bc96010
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			<@\textcolor{red}{[*] Blocks: -> C (0x7fc21bc96010) }@>
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		<@\textcolor{red}{[*] B (0x7fc21bc96040) : 0}@>
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{120:     allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+pending_head = 0x0
+node = 0x7fc21bc96040
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_sub(): prev = 3
+
+Alloc(): after
+
+Free(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 2}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		<@\textcolor{red}{[*] B (0x7fc21bc96040) : 1}@>
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  87:   void Free(Node* node) /*__attribute__((noinline))*/ {
+> <@\textcolor{magenta}{88:     if (allocation\_count\_.load() == 0) \{}@>
+  89:       item_list_.Push(node);
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96040
+available = 0x2
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 2
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  13:   void Push(Node* node) {
+> <@\textcolor{magenta}{14:     Node* current\_top = top\_.load();}@>
+  15:     do {
+
+Local variables: 
+current_top = 0x200413133
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96040
+available = 0x2
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  15:     do {
+> <@\textcolor{magenta}{16:       node->next\_.store(current\_top);}@>
+  17:     } while (!top_.compare_exchange_weak(current_top, node));
+
+Local variables: 
+current_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96040
+available = 0x2
+node_index = 0x0
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 12 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  48:       }
+> <@\textcolor{magenta}{49:       next\_top = curr\_top->next\_.load();}@>
+  50:     } while (!top_.compare_exchange_weak(curr_top, next_top));
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x100000002
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96010
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x7fc21bc96010
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 13 (THREAD 1)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  15:     do {
+> <@\textcolor{magenta}{16:       node->next\_.store(current\_top);}@>
+  17:     } while (!top_.compare_exchange_weak(current_top, node));
+
+Local variables: 
+current_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96040
+available = 0x2
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  16:       node->next_.store(current_top);
+> <@\textcolor{magenta}{17:     \} while (!top\_.compare\_exchange\_weak(current\_top, node));}@>
+  18:   }
+
+Local variables: 
+current_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96040
+available = 0x2
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+Free(): after
+
+Free(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			<@\textcolor{red}{[*] Blocks: -> B (0x7fc21bc96040) }@>
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		<@\textcolor{red}{[*] A (0x7fc21bc96070) : 1}@>
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  87:   void Free(Node* node) /*__attribute__((noinline))*/ {
+> <@\textcolor{magenta}{88:     if (allocation\_count\_.load() == 0) \{}@>
+  89:       item_list_.Push(node);
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 2
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  13:   void Push(Node* node) {
+> <@\textcolor{magenta}{14:     Node* current\_top = top\_.load();}@>
+  15:     do {
+
+Local variables: 
+current_top = 0x200413133
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96040
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 4}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  15:     do {
+> <@\textcolor{magenta}{16:       node->next\_.store(current\_top);}@>
+  17:     } while (!top_.compare_exchange_weak(current_top, node));
+
+Local variables: 
+current_top = 0x7fc21bc96040
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 5}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Push(Node*)
+  16:       node->next_.store(current_top);
+> <@\textcolor{magenta}{17:     \} while (!top\_.compare\_exchange\_weak(current\_top, node));}@>
+  18:   }
+
+Local variables: 
+current_top = 0x7fc21bc96040
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Free(Node*)
+  90:     } else {
+> <@\textcolor{magenta}{91:       pending\_list\_.Push(node);}@>
+  92:     }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  66:           Node* to_free = pool.Acquire(node_index);
+> <@\textcolor{magenta}{67:           stack.Free(to\_free);}@>
+  68:           SHOW_NOTE("Free(): after");
+
+Local variables: 
+to_free = 0x7fc21bc96070
+available = 0x1
+node_index = 0x0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+Free(): after
+
+Alloc(): before
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 6}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			<@\textcolor{red}{[*] Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) }@>
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Top()
+  38:   Node* Top() {
+> <@\textcolor{magenta}{39:     return top\_.load();}@>
+  40:   }
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  96:     // auto keep_count = pending_count_.load();
+> <@\textcolor{magenta}{97:     Node* pending\_head = pending\_list\_.Top();}@>
+
+Local variables: 
+pending_head = 0x7fc21bc8cea0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96070
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 7}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 2
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{99:     if (allocation\_count\_.fetch\_add(1) == 0) \{}@>
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+fetch_add: prev = 2
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 8}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) 
+		    }
+
+		<@\textcolor{red}{[*] allocation\_count\_: 3}@>
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  42:   Node* Pop() {
+> <@\textcolor{magenta}{43:     Node* curr\_top = top\_.load();}@>
+  44:     Node* next_top;
+
+Local variables: 
+curr_top = 0x100000005
+next_top = 0x100000002
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96010
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 9}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  48:       }
+> <@\textcolor{magenta}{49:       next\_top = curr\_top->next\_.load();}@>
+  50:     } while (!top_.compare_exchange_weak(curr_top, next_top));
+
+Local variables: 
+curr_top = 0x7fc21bc96010
+next_top = 0x100000002
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                       <@\textcolor{cyan}{SNAPSHOT 10}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: -> C (0x7fc21bc96010) 
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 1
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96010
+next_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			<@\textcolor{red}{[*] Blocks: }@>
+		    }
+
+		    Pending {
+			    Blocks: -> A (0x7fc21bc96070) -> B (0x7fc21bc96040) 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		<@\textcolor{red}{[*] C (0x7fc21bc96010) : 0}@>
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{120:     allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7fc21bc96010
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 14 (THREAD 3)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::TryClear(Node*)
+  55:     Node* desired = nullptr;
+> <@\textcolor{magenta}{56:     return top\_.compare\_exchange\_strong(expected, desired);}@>
+  57:   }
+
+Local variables: 
+desired = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  100:       if (pending_head != nullptr /*&& keep_count == pending_count_.load()*/
+> <@\textcolor{magenta}{101:           \&\& pending\_list\_.TryClear(pending\_head)) \{}@>
+  102:         auto head = pending_head;
+
+Local variables: 
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_strong(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 1}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: 
+		    }
+
+		    Pending {
+			<@\textcolor{red}{[*] Blocks: }@>
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 1
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{104:         pending\_head = pending\_head->next\_.load();}@>
+  105:         head->Release();
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96070
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0x7fc21bc96040
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 2}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		<@\textcolor{red}{[*] A (0x7fc21bc96070) : 0}@>
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Append(Node*)
+  25:     Node* tail = head;
+> <@\textcolor{magenta}{26:     Node* next = tail->next\_.load();}@>
+  27:     while (next != nullptr) {
+
+Local variables: 
+tail = 0x7fc21bc96040
+next = 0x7fc21baaa6a0
+prev_top = 0x7fc21baaa690
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{107:         item\_list\_.Append(pending\_head);}@>
+  108:         // pending_count_.fetch_add(1);
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96040
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 3}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Append(Node*)
+> <@\textcolor{magenta}{32:     Node* prev\_top = top\_.load();}@>
+  33:     do {
+
+Local variables: 
+tail = 0x7fc21bc96040
+next = 0x0
+prev_top = 0x7fc21baaa690
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{107:         item\_list\_.Append(pending\_head);}@>
+  108:         // pending_count_.fetch_add(1);
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96040
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+load(): 0
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 4}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Append(Node*)
+  33:     do {
+> <@\textcolor{magenta}{34:       tail->next\_ = prev\_top;}@>
+  35:     } while (!top_.compare_exchange_weak(prev_top, head));
+
+Local variables: 
+tail = 0x7fc21bc96040
+next = 0x0
+prev_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{107:         item\_list\_.Append(pending\_head);}@>
+  108:         // pending_count_.fetch_add(1);
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96040
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                        <@\textcolor{cyan}{SNAPSHOT 5}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			    Blocks: 
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Append(Node*)
+  34:       tail->next_ = prev_top;
+> <@\textcolor{magenta}{35:     \} while (!top\_.compare\_exchange\_weak(prev\_top, head));}@>
+  36:   }
+
+Local variables: 
+tail = 0x7fc21bc96040
+next = 0x0
+prev_top = 0x0
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{107:         item\_list\_.Append(pending\_head);}@>
+  108:         // pending_count_.fetch_add(1);
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96040
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			<@\textcolor{red}{[*] Blocks: -> B (0x7fc21bc96040) }@>
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		    B (0x7fc21bc96040) : 1
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+  108:         // pending_count_.fetch_add(1);
+> <@\textcolor{magenta}{109:         allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+head = 0x7fc21bc96070
+pending_head = 0x7fc21bc96040
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x0
+node_index = 0xffffffff
+
+<@\textcolor{yellow}{==========================================================================================}@>
+                                    <@\textcolor{yellow}{RUN 15 (THREAD 2)}@>
+<@\textcolor{yellow}{==========================================================================================}@>
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{BEFORE}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LockFreeStack::Pop()
+  49:       next_top = curr_top->next_.load();
+> <@\textcolor{magenta}{50:     \} while (!top\_.compare\_exchange\_weak(curr\_top, next\_top));}@>
+  51:     return curr_top;
+
+Local variables: 
+curr_top = 0x7fc21bc96040
+next_top = 0x7fc21bc96010
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{115:     auto node = item\_list\_.Pop();}@>
+  116:     if (node != nullptr) {
+
+Local variables: 
+pending_head = 0x0
+node = 0x7ffd4ad1d480
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                         <@\textcolor{cyan}{RUNNING}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+compare_exchange_weak(): succeeded = 1
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+                                          <@\textcolor{cyan}{AFTER}@>
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+
+<@\textcolor{red}{SHARED STATE:}@>
+
+    LFAlloc {
+	    LFStack {
+		    Head {
+			<@\textcolor{red}{[*] Blocks: -> C (0x7fc21bc96010) }@>
+		    }
+
+		    Pending {
+			    Blocks: 
+		    }
+
+		    allocation_count_: 3
+	    }
+
+	    Memory {
+		    C (0x7fc21bc96010) : 0
+		<@\textcolor{red}{[*] B (0x7fc21bc96040) : 0}@>
+		    A (0x7fc21bc96070) : 0
+	    }
+
+    }
+
+<@\textcolor{cyan}{------------------------------------------------------------------------------------------}@>
+<@\textcolor{magenta}{
+STACK:
+}@>
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/alloc_lfstack.hpp",
+in LFAllocator::Alloc()
+> <@\textcolor{magenta}{120:     allocation\_count\_.fetch\_sub(1);}@>
+
+Local variables: 
+pending_head = 0x0
+node = 0x7fc21bc96040
+
+<@\textcolor{cyan}{----------------}@>
+
+Object "/home/sham42/git/twist-mc-test/tests/alloc_lfstack3/test.cpp",
+in operator()
+  61:           SHOW_NOTE("Alloc(): before");
+> <@\textcolor{magenta}{62:           stack.Alloc();}@>
+  63:           SHOW_NOTE("Alloc(): after");
+
+Local variables: 
+available = 0x1
+node_index = 0xffffffff
+
+<@\textcolor{red}{==========================================================================================}@>
+                                     <@\textcolor{red}{ASSERTION FAILED}@>
+<@\textcolor{red}{==========================================================================================}@>
+
+ItemList: assertion failed
+<@\textcolor{red}{
+==========================================================================================
+}@>
+
+\end{lstlisting}
+
+\end{multicols*}
+
+\end{allintypewriter}
+
+\end{adjustwidth}
 
 
-Для упорядочивания ссылок можно использовать разделительные символы.
-Например, \verb+\label{fig:scheemes/my_scheeme}+ или \\ \verb+\label{lst:dts/linked_list}+.
-
-\section{Очередной подраздел приложения}~\label{app:B5}
-
-Нужно больше подразделов приложения!
-
-\section{И ещё один подраздел приложения}~\label{app:B6}
-
-Нужно больше подразделов приложения!
-
-\clearpage
-\refstepcounter{chapter}
-\addcontentsline{toc}{appendix}{\protect\chapternumberline{\thechapter}Чертёж детали}
-
-\includepdf[pages=-]{Dissertation/images/drawing.pdf}
